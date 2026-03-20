@@ -101,6 +101,39 @@ async function fetchRemoteSales(): Promise<Sale[]> {
   }));
 }
 
+async function syncEventConfig(event: EventConfig): Promise<void> {
+  const { error } = await supabase
+    .from('ticketmaster_event_config')
+    .upsert({
+      id: 'default',
+      name: event.name,
+      date: event.date,
+      goal: event.goal,
+      default_ticket_price: event.defaultTicketPrice,
+      banner_image: event.bannerImage || null,
+    });
+  if (error) throw error;
+}
+
+async function fetchRemoteEventConfig(): Promise<EventConfig | null> {
+  const { data, error } = await supabase
+    .from('ticketmaster_event_config')
+    .select('*')
+    .eq('id', 'default')
+    .maybeSingle();
+
+  if (error) throw error;
+  if (!data) return null;
+
+  return {
+    name: data.name,
+    date: data.date,
+    goal: Number(data.goal),
+    defaultTicketPrice: Number(data.default_ticket_price),
+    bannerImage: data.banner_image || undefined,
+  };
+}
+
 // ─── MAIN APP ─────────────────────────────────────────────────────────────────
 
 export default function App() {
@@ -122,6 +155,7 @@ export default function App() {
   const [syncError, setSyncError] = useState<string | null>(null);
   const [toast, setToast] = useState<{ msg: string; type: 'success' | 'error' } | null>(null);
   const [saleToDelete, setSaleToDelete] = useState<Sale | null>(null);
+  const [eventChangedLocally, setEventChangedLocally] = useState(false);
 
   // --- Confirm Delete ---
   const handleConfirmDelete = async (password: string) => {
@@ -166,7 +200,8 @@ export default function App() {
     // Migração: se não tiver o v2, tenta ler do key antigo (localStorage)
     let savedEvent = localStorage.getItem(LOCAL_STORAGE_EVENT_KEY);
     if (!savedEvent) savedEvent = localStorage.getItem('event_config');
-    if (savedEvent) setEvent(JSON.parse(savedEvent));
+    let localEvent: EventConfig | null = savedEvent ? JSON.parse(savedEvent) : null;
+    if (localEvent) setEvent(localEvent);
 
     let localRaw = localStorage.getItem(LOCAL_STORAGE_SALES_KEY);
     if (!localRaw) localRaw = localStorage.getItem('ticket_sales'); // Key antigo (V1)
@@ -181,6 +216,18 @@ export default function App() {
 
     if (navigator.onLine) {
       (async () => {
+        try {
+          const remoteEvent = await fetchRemoteEventConfig();
+          if (remoteEvent) {
+            setEvent(remoteEvent);
+            localStorage.setItem(LOCAL_STORAGE_EVENT_KEY, JSON.stringify(remoteEvent));
+          } else if (localEvent) {
+             await syncEventConfig(localEvent); // Cria a primeira vez caso ainda não tenha no banco
+          }
+        } catch (err) {
+          console.error("Erro ao puxar event config no inicio", err);
+        }
+
         try {
           const remoteSales = await fetchRemoteSales();
           // Merge: remote is source of truth; local pending records are added on top
@@ -213,9 +260,24 @@ export default function App() {
     localStorage.setItem(LOCAL_STORAGE_EVENT_KEY, JSON.stringify(event));
   }, [event]);
 
+  // --- Auto-sync Event Config (Debounced) ---
+  useEffect(() => {
+    if (!eventChangedLocally || !isOnline) return;
+    const timeout = setTimeout(() => {
+      syncEventConfig(event)
+        .then(() => setEventChangedLocally(false))
+        .catch(err => console.error("Erro no auto-sync do evento", err));
+    }, 1500);
+    return () => clearTimeout(timeout);
+  }, [event, isOnline, eventChangedLocally]);
+
   // --- Auto-sync when coming back online ---
   useEffect(() => {
     if (!isOnline) return;
+
+    if (eventChangedLocally) {
+      syncEventConfig(event).then(() => setEventChangedLocally(false)).catch(console.error);
+    }
     const hasPending = sales.some(s => !s.synced);
     if (!hasPending) return;
 
@@ -238,6 +300,10 @@ export default function App() {
     setIsSyncing(true);
     setSyncError(null);
     try {
+      if (eventChangedLocally) {
+        await syncEventConfig(event);
+        setEventChangedLocally(false);
+      }
       const updated = await syncPendingSales(sales);
       setSales(updated);
       showToast('Sincronizado com sucesso!');
@@ -633,8 +699,8 @@ export default function App() {
       {/* Banner do Evento */}
       <BannerUploader
         currentBanner={event.bannerImage}
-        onBannerChange={base64 => setEvent(prev => ({ ...prev, bannerImage: base64 }))}
-        onBannerRemove={() => setEvent(prev => ({ ...prev, bannerImage: undefined }))}
+        onBannerChange={base64 => { setEvent(prev => ({ ...prev, bannerImage: base64 })); setEventChangedLocally(true); }}
+        onBannerRemove={() => { setEvent(prev => ({ ...prev, bannerImage: undefined })); setEventChangedLocally(true); }}
       />
 
       <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5 space-y-4">
@@ -650,10 +716,13 @@ export default function App() {
               type={type}
               step={step}
               value={event[key]}
-              onChange={e => setEvent(prev => ({
-                ...prev,
-                [key]: type === 'number' ? (step ? parseFloat(e.target.value) || 0 : parseInt(e.target.value) || 0) : e.target.value,
-              }))}
+              onChange={e => {
+                setEvent(prev => ({
+                  ...prev,
+                  [key]: type === 'number' ? (step ? parseFloat(e.target.value) || 0 : parseInt(e.target.value) || 0) : e.target.value,
+                }));
+                setEventChangedLocally(true);
+              }}
               className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-emerald-500 [color-scheme:dark]"
             />
           </div>
